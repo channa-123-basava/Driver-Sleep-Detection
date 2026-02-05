@@ -1,0 +1,14 @@
+/* SAFE RESET */
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+/* DO NOT style div or body as card */
+body {
+  font-family: Arial, sans-serif;
+  background: #f2f2f2;
+}
+
+/* just center text */
