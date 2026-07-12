@@ -5,31 +5,28 @@ import * as CameraUtils from "@mediapipe/camera_utils";
 import axios from "axios";
 import "./App.css";
 
-const ALARM_THRESHOLD_MS = 3000;   // eyes closed >3s -> alarm starts
-const NOTIFY_THRESHOLD_MS = 6000;  // eyes closed >6s -> notify family/friends
+const EYES_CLOSED_THRESHOLD_MS = 6000; // single trigger point for alarm + notification + SMS
 
 function App() {
   const webcamRef = useRef(null);
   const audioRef = useRef(new Audio("/alarm_tone.mp3"));
-  const closedSinceRef = useRef(null);   // timestamp when eyes first closed
-  const notifiedRef = useRef(false);     // prevents duplicate notifications per closure
-  const tickRef = useRef(null);          // interval id for the closed-eye timer
+  const closedTimerRef = useRef(null);   // setTimeout id for the 6s watch
+  const alertSentRef = useRef(false);    // guarantees exactly one SMS per closure
 
   // ---- STATE ----
   const [eyesClosed, setEyesClosed] = useState(false);
   const [yawning, setYawning] = useState(false);
   const [fatigueScore, setFatigueScore] = useState(0);
-  const [alertLevel, setAlertLevel] = useState(0); // 0 normal,2 warning(yawn/blink),3 alarm,4 notified
   const [audioEnabled, setAudioEnabled] = useState(false);
-  const [closedDuration, setClosedDuration] = useState(0);
-  const [location, setLocation] = useState(null);
-  const [notifyStatus, setNotifyStatus] = useState("idle"); // idle | sending | sent | failed
-  const [familyNumber, setFamilyNumber] = useState(""); // e.g. +919876543210
+  const [location, setLocation] = useState(null); // { lat, lng }
+  const [driverName, setDriverName] = useState("");
+  const [familyNumber, setFamilyNumber] = useState(""); // E.164, e.g. +919876543210
+  const [alertStatus, setAlertStatus] = useState("idle"); // idle | sending | sent | failed
+  const [alarmActive, setAlarmActive] = useState(false);
 
-  // alarm should loop until eyes reopen
   audioRef.current.loop = true;
 
-  // ---- ASK PERMISSION FOR BROWSER/DESKTOP NOTIFICATIONS ----
+  // ---- BROWSER NOTIFICATION PERMISSION ----
   useEffect(() => {
     if ("Notification" in window && Notification.permission === "default") {
       Notification.requestPermission();
@@ -38,108 +35,99 @@ function App() {
 
   const showBrowserNotification = () => {
     if (!("Notification" in window)) return;
+    const fire = () =>
+      new Notification("🚨 Driver Drowsiness Alert", {
+        body: "Eyes closed for 6+ seconds. Emergency contact is being notified.",
+      });
 
     if (Notification.permission === "granted") {
-      new Notification("🚨 Driver Alert", {
-        body: "Eyes closed for over 6 seconds — family has been notified.",
-      });
+      fire();
     } else if (Notification.permission !== "denied") {
       Notification.requestPermission().then((perm) => {
-        if (perm === "granted") {
-          new Notification("🚨 Driver Alert", {
-            body: "Eyes closed for over 6 seconds — family has been notified.",
-          });
-        }
+        if (perm === "granted") fire();
       });
     }
   };
 
-  // ---- FATIGUE SCORE ----
+  // ---- FATIGUE SCORE (display only) ----
   useEffect(() => {
     let score = 0;
     if (eyesClosed) score += 2;
     if (yawning) score += 2;
     setFatigueScore(score);
-
-    if (!eyesClosed) {
-      // baseline level from yawning alone when eyes are open
-      setAlertLevel(yawning ? 2 : 0);
-    }
   }, [eyesClosed, yawning]);
 
-  // ---- LIVE GPS TRACKING ----
+  // ---- LIVE GPS TRACKING (Geolocation API) ----
   useEffect(() => {
     if (!navigator.geolocation) return;
-
     const watchId = navigator.geolocation.watchPosition(
-      (position) => {
+      (position) =>
         setLocation({
           lat: position.coords.latitude,
           lng: position.coords.longitude,
-        });
-      },
+        }),
       (error) => console.log("GPS error:", error.message),
       { enableHighAccuracy: true, maximumAge: 5000 }
     );
-
     return () => navigator.geolocation.clearWatch(watchId);
   }, []);
 
-  // ---- EYES-CLOSED TIMER: drives alarm + notification ----
+  // ---- EYES-CLOSED WATCHER: fires alarm + notification + SMS exactly once ----
   useEffect(() => {
     if (eyesClosed) {
-      if (!closedSinceRef.current) closedSinceRef.current = Date.now();
-
-      tickRef.current = setInterval(() => {
-        const elapsed = Date.now() - closedSinceRef.current;
-        setClosedDuration(elapsed);
-
-        // >3s: alarm rings, keeps ringing until eyes open
-        if (elapsed >= ALARM_THRESHOLD_MS) {
-          setAlertLevel((prev) => (prev < 4 ? 3 : prev));
-          if (audioEnabled && audioRef.current.paused) {
-            audioRef.current.play().catch(() => {});
-          }
-        }
-
-        // >6s continuous: notify family/friends once per closure
-        if (elapsed >= NOTIFY_THRESHOLD_MS && !notifiedRef.current) {
-          notifiedRef.current = true;
-          setAlertLevel(4);
-          sendNotification();
-        }
-      }, 200);
+      closedTimerRef.current = setTimeout(() => {
+        if (alertSentRef.current) return; // already handled this closure
+        alertSentRef.current = true;
+        triggerAlert();
+      }, EYES_CLOSED_THRESHOLD_MS);
     } else {
-      // eyes reopened -> stop everything and reset for the next closure
-      clearInterval(tickRef.current);
-      closedSinceRef.current = null;
-      notifiedRef.current = false;
-      setClosedDuration(0);
-      setNotifyStatus("idle");
+      // Eyes reopened: stop alarm, clear timer, allow the next closure to alert again
+      clearTimeout(closedTimerRef.current);
+      alertSentRef.current = false;
+      setAlarmActive(false);
+      setAlertStatus("idle");
       audioRef.current.pause();
       audioRef.current.currentTime = 0;
     }
 
-    return () => clearInterval(tickRef.current);
+    return () => clearTimeout(closedTimerRef.current);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [eyesClosed, audioEnabled]);
+  }, [eyesClosed]);
 
-  const sendNotification = async () => {
-    showBrowserNotification(); // fires instantly, local popup, doesn't depend on backend
+  const triggerAlert = async () => {
+    // 1. Alarm
+    setAlarmActive(true);
+    if (audioEnabled) {
+      audioRef.current.play().catch(() => {});
+    }
 
-    setNotifyStatus("sending");
+    // 2. Browser notification
+    showBrowserNotification();
+
+    // 3. Exactly one SMS
+    if (!familyNumber || !driverName) {
+      console.warn("Missing driver name or emergency phone number — SMS not sent.");
+      setAlertStatus("failed");
+      return;
+    }
+    if (!location) {
+      console.warn("Location not yet available — SMS not sent.");
+      setAlertStatus("failed");
+      return;
+    }
+
+    setAlertStatus("sending");
     try {
-      // Requires the /api/notify route in backend/server.js (Twilio) to actually text the family number.
-      await axios.post("/api/notify", {
-        message: "Driver has had eyes closed for over 6 seconds — possible fatigue/asleep.",
-        location,
-        timestamp: new Date().toISOString(),
+      const res = await axios.post("/api/send-alert", {
         phoneNumber: familyNumber,
+        driverName,
+        latitude: location.lat,
+        longitude: location.lng,
       });
-      setNotifyStatus("sent");
+      setAlertStatus(res.data.success ? "sent" : "failed");
     } catch (err) {
-      console.error("Failed to send notification:", err);
-      setNotifyStatus("failed");
+      console.error("Failed to send alert:", err);
+      setAlertStatus("failed");
     }
   };
 
@@ -161,17 +149,13 @@ function App() {
       if (results.multiFaceLandmarks?.length) {
         const landmarks = results.multiFaceLandmarks[0];
 
-        // Eyes
         const top = landmarks[159];
         const bottom = landmarks[145];
-        const eyeDistance = Math.abs(top.y - bottom.y);
-        setEyesClosed(eyeDistance < 0.01);
+        setEyesClosed(Math.abs(top.y - bottom.y) < 0.01);
 
-        // Yawn
         const upperLip = landmarks[13];
         const lowerLip = landmarks[14];
-        const mouthDistance = Math.abs(upperLip.y - lowerLip.y);
-        setYawning(mouthDistance > 0.05);
+        setYawning(Math.abs(upperLip.y - lowerLip.y) > 0.05);
       }
     });
 
@@ -210,61 +194,45 @@ function App() {
 
       {!audioEnabled && <button onClick={enableAudio}>Enable Alarm</button>}
 
-      <br />
-      <br />
+      <br /><br />
 
       <input
+        type="text"
+        placeholder="Driver name"
+        value={driverName}
+        onChange={(e) => setDriverName(e.target.value)}
+        style={{ margin: "6px", padding: "6px", width: "220px" }}
+      />
+      <br />
+      <input
         type="tel"
-        placeholder="+91XXXXXXXXXX (family number)"
+        placeholder="+91XXXXXXXXXX (emergency contact)"
         value={familyNumber}
         onChange={(e) => setFamilyNumber(e.target.value)}
-        style={{ margin: "10px", padding: "6px", width: "220px" }}
+        style={{ margin: "6px", padding: "6px", width: "220px" }}
       />
 
-      <br />
+      <br /><br />
 
       <Webcam ref={webcamRef} audio={false} width={400} height={300} />
 
       <h3 style={{ color: eyesClosed ? "red" : "green" }}>
         {eyesClosed ? "😴 Eyes Closed" : "👀 Eyes Open"}
       </h3>
-
       <h3>😮 Yawning: {yawning ? "Yes" : "No"}</h3>
-
       <h3>📊 Fatigue Score: {fatigueScore}</h3>
 
-      {eyesClosed && (
-        <h4>⏱️ Eyes closed for: {(closedDuration / 1000).toFixed(1)}s</h4>
-      )}
-
-      <h3
-        style={{
-          color:
-            alertLevel === 4
-              ? "darkred"
-              : alertLevel === 3
-              ? "red"
-              : alertLevel === 2
-              ? "orange"
-              : "green",
-        }}
-      >
-        {alertLevel === 4
-          ? "🚨🚨 CRITICAL: Family/friends notified!"
-          : alertLevel === 3
-          ? "🚨 DANGER: Wake up!"
-          : alertLevel === 2
-          ? "⚠️ Warning: You look tired"
-          : "✅ Normal"}
+      <h3 style={{ color: alarmActive ? "red" : "green" }}>
+        {alarmActive ? "🚨 ALARM: Wake up!" : "✅ Normal"}
       </h3>
 
-      {notifyStatus !== "idle" && (
+      {alertStatus !== "idle" && (
         <p>
-          Notification status:{" "}
-          {notifyStatus === "sending"
+          Emergency SMS:{" "}
+          {alertStatus === "sending"
             ? "Sending..."
-            : notifyStatus === "sent"
-            ? "✅ Sent to family/friends"
+            : alertStatus === "sent"
+            ? "✅ Sent to emergency contact"
             : "❌ Failed to send"}
         </p>
       )}
@@ -275,7 +243,7 @@ function App() {
           <p>Latitude: {location.lat}</p>
           <p>Longitude: {location.lng}</p>
           <a
-            href={`https://www.google.com/maps?q=${location.lat},${location.lng}`}
+            href={`https://maps.google.com/?q=${location.lat},${location.lng}`}
             target="_blank"
             rel="noopener noreferrer"
           >
