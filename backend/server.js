@@ -1,43 +1,21 @@
-import express from "express";
-import cors from "cors";
-import dotenv from "dotenv";
-import twilio from "twilio";
+const sendMessage = require("./services/sendMessage");
 
-dotenv.config();
+// ... keep your existing app.use(cors()), app.use(express.json()), etc.
 
-const app = express();
+app.post("/api/notify", async (req, res) => {
+  const { message, location, timestamp } = req.body;
 
-app.use(cors());
-app.use(express.json());
+  const mapsLink = location
+    ? `https://www.google.com/maps?q=${location.lat},${location.lng}`
+    : "location unavailable";
 
-const client = twilio(
-  process.env.TWILIO_SID,
-  process.env.TWILIO_AUTH
-);
+  const body = `${message}\nTime: ${timestamp}\nLocation: ${mapsLink}`;
 
-// 🚨 Alert API
-app.post("/alert", async (req, res) => {
   try {
-    await client.messages.create({
-      from: "whatsapp:+14155238886", // Twilio sandbox number
-      to: "whatsapp:+918310292238",  // 👈 FRIEND / FAMILY WHATSAPP NUMBER
-      body:
-        "🚨 ALERT: Driver is sleeping continuously. Please contact immediately!",
-    });
-
-    console.log("💬 WhatsApp alert sent");
-    res.json({ success: true });
-  } catch (error) {
-    console.error("❌ WhatsApp failed:", error.message);
-    res.status(500).json({ success: false });
+    await sendMessage(body);
+    res.status(200).json({ ok: true, sent: true });
+  } catch (err) {
+    console.error("Notification failed:", err.message);
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
-
-app.get("/", (req, res) => {
-  res.send("Backend is running 🚀");
-});
-
-app.listen(5000, () => {
-  console.log("✅ Backend running on port 5000");
-});
- 
